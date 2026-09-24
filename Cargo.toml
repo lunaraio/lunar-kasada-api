@@ -1,5 +1,5 @@
 [package]
-name = "lunar-api"
+name = "lunar-kasada-api"
 version = "0.1.0"
 edition = "2024"
 
@@ -32,7 +32,7 @@ oxc_ast = "0.151.0"
 actix-web = "4.14.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 oxc_span = "0.151.0"
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 oxc_syntax = "0.151.0"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 oxc_parser = "0.151.0"
