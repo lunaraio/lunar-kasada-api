@@ -1,10 +1,12 @@
 use oxc_ast::ast::{
-    BinaryOperator, CallExpression, Expression, Function, NumericLiteral, Statement, UnaryOperator,
+    BinaryOperator, CallExpression, Expression, Function, LogicalOperator, NumericLiteral, Statement,
+    UnaryOperator,
 };
 use oxc_ast_visit::{Visit, walk};
 use thiserror::Error;
 
 use super::ast::{body, binding_name, ident, is_ident, is_static_call, num, param_name};
+use super::opaque::{self, J};
 
 const TAG_COUNT: usize = 6;
 const SIGN_BIT: f64 = 2147483648.0;
@@ -75,6 +77,7 @@ struct Simulator<'s> {
     word: &'s str,
     table: &'s str,
     registers: &'s str,
+    own: Option<&'s str>,
     key: Option<usize>,
 }
 
@@ -109,6 +112,7 @@ pub fn analyze(func: &Function<'_>, table: &[f64]) -> Result<OperandModel, Opera
         word,
         table: tbl,
         registers,
+        own: func.id.as_ref().map(|id| id.name.as_str()),
         key: None,
     };
     let reg_shift = match sim.run_list(tail)? {
@@ -294,13 +298,35 @@ impl Simulator<'_> {
     }
 
     fn test<'a>(&self, expr: &Expression<'a>) -> Result<Option<bool>, OperandError> {
+        if let Expression::LogicalExpression(l) = expr {
+            let left = self.test(&l.left)?;
+            return Ok(match l.operator {
+                LogicalOperator::And => match left {
+                    Some(false) => Some(false),
+                    _ => match (left, self.test(&l.right)?) {
+                        (_, Some(false)) => Some(false),
+                        (Some(true), right) => right,
+                        _ => None,
+                    },
+                },
+                LogicalOperator::Or => match left {
+                    Some(true) => Some(true),
+                    _ => match (left, self.test(&l.right)?) {
+                        (_, Some(true)) => Some(true),
+                        (Some(false), right) => right,
+                        _ => None,
+                    },
+                },
+                LogicalOperator::Coalesce => None,
+            });
+        }
         let Expression::BinaryExpression(bin) = expr else {
-            return Ok(None);
+            return Ok(opaque::eval(expr, self.own).map(|v| v.truthy()));
         };
         let equal = match bin.operator {
             BinaryOperator::StrictEquality | BinaryOperator::Equality => true,
             BinaryOperator::StrictInequality | BinaryOperator::Inequality => false,
-            _ => return Ok(None),
+            _ => return Ok(opaque::eval(expr, self.own).map(|v| v.truthy())),
         };
         let index = if is_ident(&bin.left, self.word) {
             self.table_index(&bin.right)
@@ -310,7 +336,7 @@ impl Simulator<'_> {
             None
         };
         let Some(index) = index else {
-            return Ok(None);
+            return Ok(opaque::eval(expr, self.own).map(|v| v.truthy()));
         };
         if index.fract() != 0.0 || !(0.0..TAG_COUNT as f64).contains(&index) {
             return Err(OperandError::TagIndex(index));
@@ -343,7 +369,7 @@ impl Simulator<'_> {
                     Ok(Role::False)
                 }
                 (UnaryOperator::Void, _) => Ok(Role::Undefined),
-                _ => self.region_expr(expr),
+                _ => self.constant(expr).map_or_else(|| self.region_expr(expr), Ok),
             },
             Expression::BooleanLiteral(b) => Ok(if b.value { Role::True } else { Role::False }),
             Expression::NullLiteral(_) => Ok(Role::Null),
@@ -361,7 +387,17 @@ impl Simulator<'_> {
                 }
                 Err(OperandError::RegisterShift)
             }
-            _ => self.region_expr(expr),
+            _ => self.constant(expr).map_or_else(|| self.region_expr(expr), Ok),
+        }
+    }
+
+    fn constant<'a>(&self, expr: &Expression<'a>) -> Option<Role> {
+        match opaque::eval(expr, self.own)? {
+            J::Bool(true) => Some(Role::True),
+            J::Bool(false) => Some(Role::False),
+            J::Null => Some(Role::Null),
+            J::Undef => Some(Role::Undefined),
+            _ => None,
         }
     }
 

@@ -14,6 +14,7 @@ mod fold;
 mod handlers;
 pub mod ir;
 mod lift;
+mod opaque;
 mod operand;
 pub mod pipeline;
 pub mod probe;
