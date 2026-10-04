@@ -383,6 +383,10 @@ impl<'a> Collector<'a> {
                 });
             }
         }
+        self.canon.prepare(array.elements.iter().filter_map(|element| match element {
+            ArrayExpressionElement::FunctionExpression(func) => Some(&**func),
+            _ => None,
+        }));
         let mut ops = [Op::GeRO; HANDLER_COUNT];
         let mut owner = [UNOWNED; HANDLER_COUNT];
         for (raw, element) in array.elements.iter().enumerate() {
