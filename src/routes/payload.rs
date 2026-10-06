@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,14 +12,15 @@ use url::Url;
 use rand::RngExt;
 
 use crate::payload::assemble;
-use crate::payload::catalog::Catalog;
+use crate::payload::catalog::{Catalog, IosProfile};
 use crate::payload::pipeline;
-use crate::payload::query::{IpsQuery, QueryError};
+use crate::payload::query::{IpsQuery, QueryError, Site};
 use crate::payload::timing::{Timeline, Transfer};
 use crate::payload::values::{self, Context, DeviceView};
 use crate::utils::profiles::Profiles;
 
 const FP_PATH: &str = "/[guid]/fp?x-kpsdk-v=";
+const FP_BARE_PATH: &str = "/[guid]/fp";
 const FP_BODY_CHILDREN: f64 = 5.0;
 const FP_BASE_SCRIPTS: usize = 2;
 const BODY_TAG: &str = "<body";
@@ -50,6 +52,7 @@ pub struct PayloadRequest {
     pub window: Option<WindowOverride>,
     pub parent: Option<String>,
     pub fp_html: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +78,12 @@ struct KpsdkHeaders<'a> {
     v: &'a str,
     #[serde(rename = "x-kpsdk-im")]
     im: &'a str,
+    #[serde(rename = "x-kpsdk-h", skip_serializing_if = "Option::is_none")]
+    h: Option<&'a str>,
+    #[serde(rename = "x-kpsdk-fc", skip_serializing_if = "Option::is_none")]
+    fc: Option<&'a str>,
+    #[serde(rename = "user-agent", skip_serializing_if = "Option::is_none")]
+    user_agent: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +97,9 @@ pub struct Solved {
     pub dt: String,
     pub v: String,
     pub im: String,
+    pub h: Option<String>,
+    pub fc: Option<String>,
+    pub user_agent: Option<String>,
     pub payload: String,
 }
 
@@ -99,6 +111,9 @@ impl Solved {
                 dt: &self.dt,
                 v: &self.v,
                 im: &self.im,
+                h: self.h.as_deref(),
+                fc: self.fc.as_deref(),
+                user_agent: self.user_agent.as_deref(),
             },
             payload: &self.payload,
         })
@@ -182,6 +197,31 @@ pub fn solve(profiles: &Profiles, req: &PayloadRequest, timeline: &Timeline) -> 
         return Err(bad_request("window values must be finite numbers"));
     }
     dev.set_window(win.and_then(|w| w.outer), win.and_then(|w| w.screen));
+    let ios = match query.site {
+        Site::NikeApi => {
+            let profile = match IosProfile::get() {
+                Ok(p) => p,
+                Err(e) => return Err(HttpResponse::InternalServerError().json(ErrorBody { error: &e.to_string() })),
+            };
+            match req.user_agent.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                Some(agent) => match profile.matching(agent) {
+                    Some(view) => Some((view, agent)),
+                    None => return Err(HttpResponse::UnprocessableEntity().json(ErrorBody { error: "user_agent names a device with no profile" })),
+                },
+                None => {
+                    let view = profile.rotate();
+                    Some((view, view.user_agent()))
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some((view, agent)) = ios {
+        dev.apply(view.dev());
+        dev.set_agent(agent);
+    }
+    let user_agent = ios.map(|(_, agent)| agent.to_owned());
+    let ios = ios.map(|(view, _)| view);
     let origin = url.origin().ascii_serialization();
     let host = url.host_str().unwrap_or_default().to_owned();
     let (query_param, query_value) = url
@@ -198,14 +238,18 @@ pub fn solve(profiles: &Profiles, req: &PayloadRequest, timeline: &Timeline) -> 
             }
             Err(e) => return Err(bad_request(&format!("parent: {e}"))),
         },
+        None if ios.is_some() => (String::new(), String::new()),
         None => (origin.clone(), format!("{origin}/")),
     };
     let (body_children, extra_globals) = fp_page(req.fp_html.as_deref());
     let lite = timeline.lite(&mut rand::rng());
     let ctx = Context {
-        href_guid: format!("{origin}{FP_PATH}{}", query.v),
+        href_guid: match query.site {
+            Site::NikeApi => format!("{origin}{FP_BARE_PATH}"),
+            _ => format!("{origin}{FP_PATH}{}", query.v),
+        },
         referrer,
-        cross_origin: ancestor != origin,
+        cross_origin: ios.is_none() && ancestor != origin,
         ancestor,
         extra_globals,
         origin,
@@ -221,6 +265,7 @@ pub fn solve(profiles: &Profiles, req: &PayloadRequest, timeline: &Timeline) -> 
         collect_lite: lite.collect(),
         elapsed: timeline.elapsed(),
         transfer_rate: timeline.transfer_rate(),
+        ios,
     };
     let out = match pipeline::run(script, now_ms, &ctx, &dev) {
         Ok(o) => o,
@@ -243,6 +288,9 @@ pub fn solve(profiles: &Profiles, req: &PayloadRequest, timeline: &Timeline) -> 
         dt,
         v: query.v.to_owned(),
         im: query.im.to_owned(),
+        h: query.h.map(Cow::into_owned),
+        fc: query.fc.map(Cow::into_owned),
+        user_agent,
         payload,
     })
 }

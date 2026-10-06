@@ -71,6 +71,22 @@ fn is_loopback(p: &str) -> bool {
     LOOPBACK_HOSTS.iter().any(|l| host.eq_ignore_ascii_case(l))
 }
 
+pub fn build_ios_client(proxy: Option<&str>) -> Result<Client, ClientError> {
+    let emulation = wreq_util::Emulation::builder()
+        .profile(wreq_util::Profile::SafariIos26_2)
+        .platform(wreq_util::Platform::IOS)
+        .headers(false)
+        .build();
+    let mut builder = Client::builder().emulation(emulation).cookie_store(false).gzip(true).brotli(true).deflate(true).zstd(true).timeout(CLIENT_TIMEOUT);
+    if let Some(p) = proxy.map(str::trim).filter(|p| !p.is_empty()) {
+        builder = builder.proxy(build_proxy(p)?);
+        if is_loopback(p) {
+            builder = builder.tls_cert_verification(false);
+        }
+    }
+    builder.build().map_err(ClientError::Build)
+}
+
 pub fn build_client(proxy: Option<&str>, cookie_store: bool) -> Result<Client, ClientError> {
     let mut builder = Client::builder()
         .emulation(tls::emulation())

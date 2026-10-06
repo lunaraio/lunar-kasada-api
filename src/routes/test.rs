@@ -17,8 +17,9 @@ use wreq::header::{
 use super::payload::{self, PayloadRequest};
 use std::time::Instant;
 
+use crate::payload::catalog::IosProfile;
 use crate::payload::timing::{Fetch, Timeline, Transfer};
-use crate::utils::client::build_client;
+use crate::utils::client::{build_client, build_ios_client};
 use crate::utils::profiles::Profiles;
 use crate::utils::r#static;
 
@@ -70,6 +71,53 @@ const FP_HEADER_ORDER: &[&str] = &[
     "accept-language",
     "priority",
 ];
+const NIKE_API_FP_HEADER_ORDER: &[&str] = &[
+    "accept",
+    "sec-fetch-site",
+    "x-kpsdk-h",
+    "x-kpsdk-dv",
+    "sec-fetch-mode",
+    "user-agent",
+    "x-kpsdk-v",
+    "sec-fetch-dest",
+    "accept-language",
+    "priority",
+    "accept-encoding",
+];
+const NIKE_API_IPS_HEADER_ORDER: &[&str] = &[
+    "sec-fetch-dest",
+    "user-agent",
+    "accept",
+    "referer",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "accept-language",
+    "priority",
+    "accept-encoding",
+    "cookie",
+];
+const NIKE_API_TL_HEADER_ORDER: &[&str] = &[
+    "content-type",
+    "x-kpsdk-ct",
+    "accept",
+    "x-kpsdk-fc",
+    "sec-fetch-site",
+    "x-kpsdk-h",
+    "x-kpsdk-dt",
+    "x-kpsdk-dv",
+    "sec-fetch-mode",
+    "x-kpsdk-v",
+    "origin",
+    "user-agent",
+    "x-kpsdk-im",
+    "referer",
+    "content-length",
+    "sec-fetch-dest",
+    "accept-language",
+    "priority",
+    "accept-encoding",
+    "cookie",
+];
 const IPS_HEADER_ORDER: &[&str] = &[
     "sec-ch-ua-platform",
     "user-agent",
@@ -97,6 +145,15 @@ const KPSDK_DT: HeaderName = HeaderName::from_static("x-kpsdk-dt");
 const KPSDK_IM: HeaderName = HeaderName::from_static("x-kpsdk-im");
 const KPSDK_V: HeaderName = HeaderName::from_static("x-kpsdk-v");
 const KPSDK_ST: HeaderName = HeaderName::from_static("x-kpsdk-st");
+const KPSDK_H: HeaderName = HeaderName::from_static("x-kpsdk-h");
+const KPSDK_DV: HeaderName = HeaderName::from_static("x-kpsdk-dv");
+const KPSDK_FC: HeaderName = HeaderName::from_static("x-kpsdk-fc");
+const NIKE_API_ACCEPT: HeaderValue = HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+const NONE_SITE: HeaderValue = HeaderValue::from_static("none");
+const DOCUMENT: HeaderValue = HeaderValue::from_static("document");
+const NIKE_API_SCRIPT_PRIORITY: HeaderValue = HeaderValue::from_static("u=1, i");
+const NIKE_API_TL_PRIORITY: HeaderValue = HeaderValue::from_static("u=3, i");
+const NIKE_API_HOST: &str = "api.nike.com";
 const OCTET_STREAM: HeaderValue = HeaderValue::from_static("application/octet-stream");
 const CORS: HeaderValue = HeaderValue::from_static("cors");
 const EMPTY: HeaderValue = HeaderValue::from_static("empty");
@@ -194,6 +251,9 @@ fn orig_headers(order: &[&'static str]) -> OrigHeaderMap {
 }
 
 static FP_ORIG_HEADERS: LazyLock<OrigHeaderMap> = LazyLock::new(|| orig_headers(FP_HEADER_ORDER));
+static NIKE_API_FP_ORIG_HEADERS: LazyLock<OrigHeaderMap> = LazyLock::new(|| orig_headers(NIKE_API_FP_HEADER_ORDER));
+static NIKE_API_IPS_ORIG_HEADERS: LazyLock<OrigHeaderMap> = LazyLock::new(|| orig_headers(NIKE_API_IPS_HEADER_ORDER));
+static NIKE_API_TL_ORIG_HEADERS: LazyLock<OrigHeaderMap> = LazyLock::new(|| orig_headers(NIKE_API_TL_HEADER_ORDER));
 static IPS_ORIG_HEADERS: LazyLock<OrigHeaderMap> = LazyLock::new(|| orig_headers(IPS_HEADER_ORDER));
 static TL_ORIG_HEADERS: LazyLock<OrigHeaderMap> = LazyLock::new(|| orig_headers(TL_HEADER_ORDER));
 
@@ -327,19 +387,38 @@ pub async fn test(
     if version.is_empty() {
         return bad_request("version is empty");
     }
-    let client = match req.proxy_url.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) => match build_client(Some(p), false) {
+    let proxy = req.proxy_url.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let client = match (domain.eq_ignore_ascii_case(NIKE_API_HOST), proxy) {
+        (true, p) => match build_ios_client(p) {
             Ok(c) => c,
             Err(e) => return bad_request(&e.to_string()),
         },
-        None => client,
+        (false, Some(p)) => match build_client(Some(p), false) {
+            Ok(c) => c,
+            Err(e) => return bad_request(&e.to_string()),
+        },
+        (false, None) => client,
+    };
+    let nike_api = domain.eq_ignore_ascii_case(NIKE_API_HOST);
+    let nike_ua: Option<&'static str> = match (nike_api, IosProfile::get()) {
+        (false, _) => None,
+        (true, Ok(p)) => Some(p.rotate().user_agent()),
+        (true, Err(e)) => return bad_gateway(&e.to_string()),
+    };
+    let nike_agent = match HeaderValue::from_str(nike_ua.unwrap_or(r#static::USER_AGENT)) {
+        Ok(v) => v,
+        Err(e) => return bad_gateway(&e.to_string()),
     };
     let mut raw = String::with_capacity(HTTPS_PREFIX.len() + domain.len() + r#static::FP_PATH.len() + version.len());
     raw.push_str(HTTPS_PREFIX);
     raw.push_str(domain);
     let origin_len = raw.len();
-    raw.push_str(r#static::FP_PATH);
-    raw.push_str(version);
+    if nike_api {
+        raw.push_str(r#static::FP_BARE_PATH);
+    } else {
+        raw.push_str(r#static::FP_PATH);
+        raw.push_str(version);
+    }
     let url = match Url::parse(&raw) {
         Ok(u) => u,
         Err(e) => return bad_request(&e.to_string()),
@@ -371,25 +450,43 @@ pub async fn test(
             Err(e) => return bad_request(&e.to_string()),
         },
     };
+    let fp_version = match HeaderValue::from_str(version) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&e.to_string()),
+    };
+    let fp = if nike_api {
+        client
+            .get(String::from(url))
+            .header(ACCEPT, NIKE_API_ACCEPT)
+            .header(SEC_FETCH_SITE, NONE_SITE)
+            .header(KPSDK_H, HeaderValue::from_static(r#static::NIKE_API_KPSDK_H))
+            .header(KPSDK_DV, HeaderValue::from_static(r#static::NIKE_API_KPSDK_DV))
+            .header(SEC_FETCH_MODE, NAVIGATE)
+            .header(USER_AGENT, nike_agent.clone())
+            .header(KPSDK_V, fp_version)
+            .header(SEC_FETCH_DEST, DOCUMENT)
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
+            .header(PRIORITY, NAVIGATE_PRIORITY)
+            .orig_headers(NIKE_API_FP_ORIG_HEADERS.clone())
+    } else {
+        client
+            .get(String::from(url))
+            .header(SEC_CH_UA, HeaderValue::from_static(r#static::SEC_CH_UA))
+            .header(SEC_CH_UA_MOBILE, MOBILE)
+            .header(SEC_CH_UA_PLATFORM, PLATFORM)
+            .header(UPGRADE_INSECURE_REQUESTS, UPGRADE)
+            .header(USER_AGENT, HeaderValue::from_static(r#static::USER_AGENT))
+            .header(ACCEPT, NAVIGATE_ACCEPT)
+            .header(SEC_FETCH_SITE, fp_site)
+            .header(SEC_FETCH_MODE, NAVIGATE)
+            .header(SEC_FETCH_DEST, IFRAME)
+            .header(REFERER, referer)
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
+            .header(PRIORITY, NAVIGATE_PRIORITY)
+            .orig_headers(FP_ORIG_HEADERS.clone())
+    };
     let fp_start = Instant::now();
-    let resp = match client
-        .get(String::from(url))
-        .header(SEC_CH_UA, HeaderValue::from_static(r#static::SEC_CH_UA))
-        .header(SEC_CH_UA_MOBILE, MOBILE)
-        .header(SEC_CH_UA_PLATFORM, PLATFORM)
-        .header(UPGRADE_INSECURE_REQUESTS, UPGRADE)
-        .header(USER_AGENT, HeaderValue::from_static(r#static::USER_AGENT))
-        .header(ACCEPT, NAVIGATE_ACCEPT)
-        .header(SEC_FETCH_SITE, fp_site)
-        .header(SEC_FETCH_MODE, NAVIGATE)
-        .header(SEC_FETCH_DEST, IFRAME)
-        .header(REFERER, referer)
-        .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
-        .header(PRIORITY, NAVIGATE_PRIORITY)
-        .orig_headers(FP_ORIG_HEADERS.clone())
-        .send()
-        .await
-    {
+    let resp = match fp.send().await {
         Ok(r) => r,
         Err(e) if e.is_builder() => return bad_request(&e.to_string()),
         Err(e) => return bad_gateway(&e.to_string()),
@@ -414,25 +511,41 @@ pub async fn test(
     let mut ips_link = String::with_capacity(origin_len + src.len());
     ips_link.push_str(&raw[..origin_len]);
     ips_link.push_str(&src.replace(AMP_ENTITY, "&"));
-    let mut ips = client
-        .get(ips_link.as_str())
-        .header(SEC_CH_UA_PLATFORM, PLATFORM)
-        .header(USER_AGENT, HeaderValue::from_static(r#static::USER_AGENT))
-        .header(SEC_CH_UA, HeaderValue::from_static(r#static::SEC_CH_UA))
-        .header(SEC_CH_UA_MOBILE, MOBILE)
-        .header(ACCEPT, SCRIPT_ACCEPT)
-        .header(SEC_FETCH_SITE, SAME_ORIGIN)
-        .header(SEC_FETCH_MODE, NO_CORS)
-        .header(SEC_FETCH_DEST, SCRIPT)
-        .header(REFERER, fp_referer.clone())
-        .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE));
+    let mut ips = if nike_api {
+        client
+            .get(ips_link.as_str())
+            .header(SEC_FETCH_DEST, SCRIPT)
+            .header(USER_AGENT, nike_agent.clone())
+            .header(ACCEPT, SCRIPT_ACCEPT)
+            .header(REFERER, fp_referer.clone())
+            .header(SEC_FETCH_SITE, SAME_ORIGIN)
+            .header(SEC_FETCH_MODE, NO_CORS)
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
+            .header(PRIORITY, NIKE_API_SCRIPT_PRIORITY)
+            .orig_headers(NIKE_API_IPS_ORIG_HEADERS.clone())
+    } else {
+        client
+            .get(ips_link.as_str())
+            .header(SEC_CH_UA_PLATFORM, PLATFORM)
+            .header(USER_AGENT, HeaderValue::from_static(r#static::USER_AGENT))
+            .header(SEC_CH_UA, HeaderValue::from_static(r#static::SEC_CH_UA))
+            .header(SEC_CH_UA_MOBILE, MOBILE)
+            .header(ACCEPT, SCRIPT_ACCEPT)
+            .header(SEC_FETCH_SITE, SAME_ORIGIN)
+            .header(SEC_FETCH_MODE, NO_CORS)
+            .header(SEC_FETCH_DEST, SCRIPT)
+            .header(REFERER, fp_referer.clone())
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
+            .header(PRIORITY, SCRIPT_PRIORITY)
+            .orig_headers(IPS_ORIG_HEADERS.clone())
+    };
     match cookie_header(&jar) {
         Some(Ok(v)) => ips = ips.header(COOKIE, v),
         Some(Err(e)) => return bad_gateway(&format!("fp cookies: {e}")),
         None => {}
     }
     let ips_start = Instant::now();
-    let resp = match ips.header(PRIORITY, SCRIPT_PRIORITY).orig_headers(IPS_ORIG_HEADERS.clone()).send().await {
+    let resp = match ips.send().await {
         Ok(r) => r,
         Err(e) if e.is_builder() => return bad_request(&e.to_string()),
         Err(e) => return bad_gateway(&e.to_string()),
@@ -486,6 +599,7 @@ pub async fn test(
             window: None,
             parent: page,
             fp_html: Some(html),
+            user_agent: nike_ua.map(str::to_owned),
         },
         &timeline,
     ) {
@@ -505,30 +619,60 @@ pub async fn test(
         (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e)) => (a, b, c, d, e),
         (Err(r), ..) | (_, Err(r), ..) | (_, _, Err(r), ..) | (_, _, _, Err(r), _) | (.., Err(r)) => return r,
     };
-    let mut tl = client
-        .post(tl_url.as_str())
-        .header(KPSDK_CT, ct)
-        .header(SEC_CH_UA_PLATFORM, PLATFORM)
-        .header(KPSDK_DT, dt)
-        .header(SEC_CH_UA, HeaderValue::from_static(r#static::SEC_CH_UA))
-        .header(KPSDK_IM, im)
-        .header(SEC_CH_UA_MOBILE, MOBILE)
-        .header(KPSDK_V, v)
-        .header(USER_AGENT, HeaderValue::from_static(r#static::USER_AGENT))
-        .header(CONTENT_TYPE, OCTET_STREAM)
-        .header(ACCEPT, SCRIPT_ACCEPT)
-        .header(ORIGIN, origin)
-        .header(SEC_FETCH_SITE, SAME_ORIGIN)
-        .header(SEC_FETCH_MODE, CORS)
-        .header(SEC_FETCH_DEST, EMPTY)
-        .header(REFERER, fp_referer)
-        .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE));
+    let mut tl = if nike_api {
+        let (h, fc) = match (solved.h.as_deref().map(header), solved.fc.as_deref().map(header)) {
+            (Some(Ok(h)), Some(Ok(fc))) => (h, fc),
+            (Some(Err(r)), _) | (_, Some(Err(r))) => return r,
+            _ => return bad_gateway("api.nike.com solve returned no x-kpsdk-h or x-kpsdk-fc"),
+        };
+        client
+            .post(tl_url.as_str())
+            .header(CONTENT_TYPE, OCTET_STREAM)
+            .header(KPSDK_CT, ct)
+            .header(ACCEPT, SCRIPT_ACCEPT)
+            .header(KPSDK_FC, fc)
+            .header(SEC_FETCH_SITE, SAME_ORIGIN)
+            .header(KPSDK_H, h)
+            .header(KPSDK_DT, dt)
+            .header(KPSDK_DV, HeaderValue::from_static(r#static::NIKE_API_KPSDK_DV))
+            .header(SEC_FETCH_MODE, CORS)
+            .header(KPSDK_V, v)
+            .header(ORIGIN, origin)
+            .header(USER_AGENT, nike_agent.clone())
+            .header(KPSDK_IM, im)
+            .header(REFERER, fp_referer)
+            .header(SEC_FETCH_DEST, EMPTY)
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
+            .header(PRIORITY, NIKE_API_TL_PRIORITY)
+            .orig_headers(NIKE_API_TL_ORIG_HEADERS.clone())
+    } else {
+        client
+            .post(tl_url.as_str())
+            .header(KPSDK_CT, ct)
+            .header(SEC_CH_UA_PLATFORM, PLATFORM)
+            .header(KPSDK_DT, dt)
+            .header(SEC_CH_UA, HeaderValue::from_static(r#static::SEC_CH_UA))
+            .header(KPSDK_IM, im)
+            .header(SEC_CH_UA_MOBILE, MOBILE)
+            .header(KPSDK_V, v)
+            .header(USER_AGENT, HeaderValue::from_static(r#static::USER_AGENT))
+            .header(CONTENT_TYPE, OCTET_STREAM)
+            .header(ACCEPT, SCRIPT_ACCEPT)
+            .header(ORIGIN, origin)
+            .header(SEC_FETCH_SITE, SAME_ORIGIN)
+            .header(SEC_FETCH_MODE, CORS)
+            .header(SEC_FETCH_DEST, EMPTY)
+            .header(REFERER, fp_referer)
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static(r#static::ACCEPT_LANGUAGE))
+            .header(PRIORITY, TL_PRIORITY)
+            .orig_headers(TL_ORIG_HEADERS.clone())
+    };
     match cookie_header(&jar) {
         Some(Ok(v)) => tl = tl.header(COOKIE, v),
         Some(Err(e)) => return bad_gateway(&format!("ips.js cookies: {e}")),
         None => {}
     }
-    let resp = match tl.header(PRIORITY, TL_PRIORITY).orig_headers(TL_ORIG_HEADERS.clone()).body(body).send().await {
+    let resp = match tl.body(body).send().await {
         Ok(r) => r,
         Err(e) if e.is_builder() => return bad_request(&e.to_string()),
         Err(e) => return bad_gateway(&e.to_string()),

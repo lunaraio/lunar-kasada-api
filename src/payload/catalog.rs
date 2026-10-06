@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -6,6 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 const SOURCE: &str = include_str!("catalog.json");
+const IOS_SOURCE: &str = include_str!("catalog_ios.json");
 const HASH_LEN: usize = 18;
 const SIMILAR_MIX: f64 = 0.5;
 
@@ -293,6 +295,142 @@ fn parse_bag<'s>(sig: &'s str, out: &mut Vec<(&'s str, u32)>) {
             None => (t, 1),
         };
         out.push((k, c));
+    }
+}
+
+#[derive(Deserialize)]
+struct IosDeviceRaw {
+    model: String,
+    os: String,
+    dev: Vec<(DevKey, Value)>,
+    lit: Vec<(u32, String, Value)>,
+    sig: Vec<(String, Value)>,
+}
+
+#[derive(Deserialize)]
+struct IosRaw {
+    agent: String,
+    dev: Vec<(DevKey, Value)>,
+    lit: Vec<(u32, String, Value)>,
+    sig: Vec<(String, Value)>,
+    stack: String,
+    devices: Vec<IosDeviceRaw>,
+}
+
+struct IosLayer {
+    dev: Vec<(DevKey, Value)>,
+    lit: FxHashMap<u32, Value>,
+    sig: FxHashMap<Box<str>, Value>,
+}
+
+impl IosLayer {
+    fn build(catalog: &Catalog, dev: Vec<(DevKey, Value)>, raw_lit: Vec<(u32, String, Value)>, raw_sig: Vec<(String, Value)>) -> Result<Self, CatalogError> {
+        let mut lit: FxHashMap<u32, Value> = FxHashMap::with_capacity_and_hasher(raw_lit.len(), Default::default());
+        for (index, id, value) in raw_lit {
+            match catalog.entries.get(index as usize) {
+                Some(e) if e.id == id => {
+                    lit.insert(index, value);
+                }
+                _ => return Err(CatalogError(format!("ios profile entry {index} ({id}) does not match the catalog"))),
+            }
+        }
+        Ok(IosLayer {
+            dev,
+            lit,
+            sig: raw_sig.into_iter().map(|(s, v)| (s.into_boxed_str(), v)).collect(),
+        })
+    }
+}
+
+struct IosDevice {
+    model: Box<str>,
+    user_agent: Box<str>,
+    layer: IosLayer,
+}
+
+pub struct IosProfile {
+    shared: IosLayer,
+    stack: String,
+    devices: Vec<IosDevice>,
+    next: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+pub struct IosView {
+    profile: &'static IosProfile,
+    device: &'static IosDevice,
+}
+
+impl IosView {
+    pub fn value(&self, entry: u32, sig: &str) -> Option<&'static Value> {
+        let device: &'static IosLayer = &self.device.layer;
+        let shared: &'static IosLayer = &self.profile.shared;
+        device
+            .sig
+            .get(sig)
+            .or_else(|| shared.sig.get(sig))
+            .or_else(|| device.lit.get(&entry))
+            .or_else(|| shared.lit.get(&entry))
+    }
+
+    pub fn stack(&self) -> &'static str {
+        let profile: &'static IosProfile = self.profile;
+        profile.stack.as_str()
+    }
+
+    pub fn user_agent(&self) -> &'static str {
+        let device: &'static IosDevice = self.device;
+        &device.user_agent
+    }
+
+    pub fn dev(&self) -> impl Iterator<Item = &'static (DevKey, Value)> {
+        let device: &'static IosLayer = &self.device.layer;
+        let shared: &'static IosLayer = &self.profile.shared;
+        shared.dev.iter().chain(device.dev.iter())
+    }
+}
+
+impl IosProfile {
+    fn build(catalog: &Catalog) -> Result<Self, CatalogError> {
+        let raw: IosRaw = serde_json::from_str(IOS_SOURCE).map_err(|e| CatalogError(e.to_string()))?;
+        if raw.devices.is_empty() {
+            return Err(CatalogError("ios profile has no devices".to_owned()));
+        }
+        let mut devices: Vec<IosDevice> = Vec::with_capacity(raw.devices.len());
+        for d in raw.devices {
+            let user_agent = raw.agent.replace("{os}", &d.os).replace("{model}", &d.model).into_boxed_str();
+            devices.push(IosDevice {
+                model: d.model.into_boxed_str(),
+                user_agent,
+                layer: IosLayer::build(catalog, d.dev, d.lit, d.sig)?,
+            });
+        }
+        Ok(IosProfile {
+            shared: IosLayer::build(catalog, raw.dev, raw.lit, raw.sig)?,
+            stack: raw.stack,
+            devices,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn get() -> Result<&'static IosProfile, CatalogError> {
+        static CELL: OnceLock<Result<IosProfile, String>> = OnceLock::new();
+        CELL.get_or_init(|| Catalog::get().and_then(IosProfile::build).map_err(|e| e.0))
+            .as_ref()
+            .map_err(|e| CatalogError(e.clone()))
+    }
+
+    pub fn rotate(&'static self) -> IosView {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.devices.len();
+        IosView {
+            profile: self,
+            device: &self.devices[index],
+        }
+    }
+
+    pub fn matching(&'static self, user_agent: &str) -> Option<IosView> {
+        let model = user_agent.trim_end().strip_suffix(')')?.rsplit("; ").next()?;
+        self.devices.iter().find(|d| &*d.model == model).map(|device| IosView { profile: self, device })
     }
 }
 

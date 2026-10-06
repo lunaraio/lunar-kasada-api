@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::catalog::{Catalog, CatalogError, CtxKey, DEV_KEYS, DevKey, FocusKind, Gen, HeapKind, MediaSrc, Tmpl};
+use super::catalog::{Catalog, CatalogError, CtxKey, DEV_KEYS, DevKey, FocusKind, Gen, HeapKind, IosView, MediaSrc, Tmpl};
 use super::compute::Layout;
 use super::devirt::{Devirt, Shard};
 use super::exec::{Interp, Names, Obj, Val, num_to_str};
@@ -32,6 +32,9 @@ const WEBRTC_TIMEOUT_CODE: f64 = 226.0;
 const WEBRTC_TIMEOUT_MS: f64 = 400.0;
 const WEBRTC_TIMEOUT_JITTER: f64 = 12.0;
 const META_VERSION: &str = "3.0";
+const IOS_TICK_P: f64 = 0.06;
+const IOS_TICK_ONE_P: f64 = 0.88;
+const IOS_TICK_MAX: u8 = 5;
 const RADIX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 const RADIX: f64 = 16.0;
 const FIXED_PRECISION: usize = 80;
@@ -77,6 +80,7 @@ pub struct Context {
     pub collect_lite: f64,
     pub elapsed: f64,
     pub transfer_rate: f64,
+    pub ios: Option<IosView>,
 }
 
 pub struct DeviceView {
@@ -176,6 +180,17 @@ impl DeviceView {
             }
         }
         DeviceView { vals }
+    }
+
+    pub fn apply(&mut self, vals: impl Iterator<Item = &'static (DevKey, Value)>) {
+        for (k, v) in vals {
+            self.vals[*k as usize] = v.clone();
+        }
+    }
+
+    pub fn set_agent(&mut self, user_agent: &str) {
+        self.vals[DevKey::UserAgent as usize] = Value::String(user_agent.to_owned());
+        self.vals[DevKey::AppVersion as usize] = Value::String(user_agent.split_once('/').map_or(user_agent, |(_, rest)| rest).to_owned());
     }
 
     fn set_num(&mut self, k: DevKey, v: Option<f64>) {
@@ -1256,16 +1271,20 @@ pub fn generate(input: Input<'_, '_>) -> Result<Values, ValuesError> {
                     }
                 }
             };
+            let mut ei = ei;
             let mut e = &catalog.entries[ei as usize];
             let is_challenge = matches!(e.v, Tmpl::Gen(Gen::Challenge))
                 || (!exact && CHALLENGE_TOKENS.iter().all(|c| sig.split('|').any(|t| t == *c)));
             if is_challenge && !matches!(e.v, Tmpl::Gen(Gen::Challenge))
-                && let Some(c) = catalog.entries.iter().find(|x| matches!(x.v, Tmpl::Gen(Gen::Challenge)))
+                && let Some(i) = catalog.entries.iter().position(|x| matches!(x.v, Tmpl::Gen(Gen::Challenge)))
             {
-                e = c;
+                ei = i as u32;
+                e = &catalog.entries[i];
             }
+            let ios_lit: Option<&'static Value> = ctx.ios.and_then(|v| v.value(ei, sig));
             let mut dt_override: Option<f64> = None;
             let owned = match &e.v {
+                _ if ios_lit.is_some() => Value::Null,
                 Tmpl::Lit { .. } => Value::Null,
                 Tmpl::Dev { p, .. } => dev.get(*p).clone(),
                 Tmpl::Ctx { p } => match p {
@@ -1325,6 +1344,7 @@ pub fn generate(input: Input<'_, '_>) -> Result<Values, ValuesError> {
                     Gen::Uuid4 => uuid4(&mut rng),
                     Gen::Xkq { values } => xkq(values, &mut rng),
                     Gen::Stack { template } => {
+                        let template = ctx.ios.map_or(template.as_str(), |v| v.stack());
                         let pos = if line == 1 { format!("1:{col}") } else { format!("{line}:{col}") };
                         let token = sig
                             .split('|')
@@ -1408,8 +1428,18 @@ pub fn generate(input: Input<'_, '_>) -> Result<Values, ValuesError> {
                 }
                 None => None,
             };
+            let dt = match (ctx.ios.is_some(), dt) {
+                (false, d) => d,
+                (true, Some(d)) => Some(d.round().max(1.0)),
+                (true, None) if rng.random::<f64>() < IOS_TICK_P => Some(if rng.random::<f64>() < IOS_TICK_ONE_P { 1.0 } else { f64::from(rng.random_range(2u8..=IOS_TICK_MAX)) }),
+                (true, None) => None,
+            };
             let head = match (structural, &e.v) {
                 (Some(v), _) => Head::Owned(v),
+                (None, _) if ios_lit.is_some() => match ios_lit {
+                    Some(v) => Head::Static(v),
+                    None => Head::Owned(owned),
+                },
                 (None, Tmpl::Lit { v }) => Head::Static(v),
                 (None, _) => Head::Owned(owned),
             };
@@ -1427,9 +1457,14 @@ pub fn generate(input: Input<'_, '_>) -> Result<Values, ValuesError> {
     t.insert(
         "t".to_owned(),
         Value::Array(vec![
-            Value::String(hex_radix(if decoys { ctx.collect } else { ctx.collect_lite })),
+            Value::String(hex_radix(match (decoys, ctx.ios.is_some()) {
+                (true, false) => ctx.collect,
+                (false, false) => ctx.collect_lite,
+                (true, true) => ctx.collect.round(),
+                (false, true) => ctx.collect_lite.round(),
+            })),
             Value::Bool(false),
-            num(ctx.elapsed),
+            num(if ctx.ios.is_some() { ctx.elapsed.round() } else { ctx.elapsed }),
             Value::String(META_VERSION.to_owned()),
         ]),
     );
