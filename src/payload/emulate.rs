@@ -39,6 +39,153 @@ enum Nat {
     Join,
     Apply,
     Call,
+    Math(MathFn),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MathFn {
+    Abs,
+    Ceil,
+    Floor,
+    Round,
+    Trunc,
+    Sign,
+    Sqrt,
+    Cbrt,
+    Pow,
+    Max,
+    Min,
+    Imul,
+    Clz32,
+    Fround,
+    Hypot,
+    Exp,
+    Log,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Atan,
+    Atan2,
+}
+
+impl MathFn {
+    fn named(key: &str) -> Option<MathFn> {
+        Some(match key {
+            "abs" => MathFn::Abs,
+            "ceil" => MathFn::Ceil,
+            "floor" => MathFn::Floor,
+            "round" => MathFn::Round,
+            "trunc" => MathFn::Trunc,
+            "sign" => MathFn::Sign,
+            "sqrt" => MathFn::Sqrt,
+            "cbrt" => MathFn::Cbrt,
+            "pow" => MathFn::Pow,
+            "max" => MathFn::Max,
+            "min" => MathFn::Min,
+            "imul" => MathFn::Imul,
+            "clz32" => MathFn::Clz32,
+            "fround" => MathFn::Fround,
+            "hypot" => MathFn::Hypot,
+            "exp" => MathFn::Exp,
+            "log" => MathFn::Log,
+            "log2" => MathFn::Log2,
+            "log10" => MathFn::Log10,
+            "sin" => MathFn::Sin,
+            "cos" => MathFn::Cos,
+            "tan" => MathFn::Tan,
+            "atan" => MathFn::Atan,
+            "atan2" => MathFn::Atan2,
+            _ => return None,
+        })
+    }
+
+    fn constant(key: &str) -> Option<f64> {
+        Some(match key {
+            "PI" => std::f64::consts::PI,
+            "E" => std::f64::consts::E,
+            "LN2" => std::f64::consts::LN_2,
+            "LN10" => std::f64::consts::LN_10,
+            "LOG2E" => std::f64::consts::LOG2_E,
+            "LOG10E" => std::f64::consts::LOG10_E,
+            "SQRT2" => std::f64::consts::SQRT_2,
+            "SQRT1_2" => std::f64::consts::FRAC_1_SQRT_2,
+            _ => return None,
+        })
+    }
+
+    fn apply(self, a: &[f64]) -> f64 {
+        let x = a.first().copied().unwrap_or(f64::NAN);
+        let y = a.get(1).copied().unwrap_or(f64::NAN);
+        match self {
+            MathFn::Abs => x.abs(),
+            MathFn::Ceil => x.ceil(),
+            MathFn::Floor => x.floor(),
+            MathFn::Round => {
+                if !x.is_finite() || x.fract() == 0.0 {
+                    x
+                } else {
+                    let r = (x + 0.5).floor();
+                    if r == 0.0 && x < 0.0 { -0.0 } else { r }
+                }
+            }
+            MathFn::Trunc => x.trunc(),
+            MathFn::Sign => {
+                if x.is_nan() || x == 0.0 {
+                    x
+                } else {
+                    x.signum()
+                }
+            }
+            MathFn::Sqrt => x.sqrt(),
+            MathFn::Cbrt => x.cbrt(),
+            MathFn::Pow => {
+                if y.is_nan() || (x.abs() == 1.0 && y.is_infinite()) {
+                    f64::NAN
+                } else {
+                    x.powf(y)
+                }
+            }
+            MathFn::Max => a.iter().try_fold(f64::NEG_INFINITY, |m, &v| {
+                if v.is_nan() {
+                    None
+                } else if v > m || (v == 0.0 && m == 0.0 && m.is_sign_negative()) {
+                    Some(v)
+                } else {
+                    Some(m)
+                }
+            }).unwrap_or(f64::NAN),
+            MathFn::Min => a.iter().try_fold(f64::INFINITY, |m, &v| {
+                if v.is_nan() {
+                    None
+                } else if v < m || (v == 0.0 && m == 0.0 && v.is_sign_negative()) {
+                    Some(v)
+                } else {
+                    Some(m)
+                }
+            }).unwrap_or(f64::NAN),
+            MathFn::Imul => f64::from(to_int32(x).wrapping_mul(to_int32(y))),
+            MathFn::Clz32 => f64::from(to_uint32(x).leading_zeros()),
+            MathFn::Fround => f64::from(x as f32),
+            MathFn::Hypot => {
+                if a.iter().any(|v| v.is_infinite()) {
+                    f64::INFINITY
+                } else {
+                    a.iter().map(|v| v * v).sum::<f64>().sqrt()
+                }
+            }
+            MathFn::Exp => x.exp(),
+            MathFn::Log => x.ln(),
+            MathFn::Log2 => x.log2(),
+            MathFn::Log10 => x.log10(),
+            MathFn::Sin => x.sin(),
+            MathFn::Cos => x.cos(),
+            MathFn::Tan => x.tan(),
+            MathFn::Atan => x.atan(),
+            MathFn::Atan2 => x.atan2(y),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +197,7 @@ enum V {
     Str(Rc<str>),
     Obj(u32),
     Global,
+    Math,
     Dispatch,
     Setter,
     Name(StrId),
@@ -336,6 +484,14 @@ impl<'x> Emulator<'x> {
                 }
                 Err("unmodelled string property")
             }
+            V::Math => {
+                let key = self.key_text(k)?;
+                match (MathFn::named(&key), MathFn::constant(&key)) {
+                    (Some(f), _) => Ok(V::Native(Nat::Math(f))),
+                    (None, Some(c)) => Ok(V::Num(c)),
+                    (None, None) => Err("unmodelled Math property"),
+                }
+            }
             V::Native(_) | V::Setter => {
                 let key = self.key_text(k)?;
                 match &*key {
@@ -455,6 +611,13 @@ impl<'x> Emulator<'x> {
                 let t = it.next().unwrap_or(V::Undef);
                 self.invoke(&target, t, it.collect())
             }
+            V::Native(Nat::Math(m)) => {
+                let mut xs: Vec<f64> = Vec::with_capacity(args.len());
+                for a in &args {
+                    xs.push(self.num(a)?);
+                }
+                Ok(V::Num(m.apply(&xs)))
+            }
             V::Native(n) => {
                 let V::Obj(id) = this else {
                     return Err("array method on non-array");
@@ -551,7 +714,7 @@ impl<'x> Emulator<'x> {
                         let pos = a.iter().position(|x| strict_eq(x, &needle));
                         return Ok(V::Num(pos.map_or(-1.0, |p| p as f64)));
                     }
-                    Nat::Join | Nat::Concat | Nat::Apply | Nat::Call => return Err("unreachable native"),
+                    Nat::Join | Nat::Concat | Nat::Apply | Nat::Call | Nat::Math(_) => return Err("unreachable native"),
                 };
                 Ok(self.alloc(Heap::Arr(fresh)))
             }
@@ -651,6 +814,9 @@ impl<'x> Emulator<'x> {
                 let ov = self.ev(t, o, ops)?;
                 let kv = self.ev(t, k, ops)?;
                 if matches!(ov, V::Global) {
+                    if matches!(&kv, V::Str(s) if &**s == "Math") {
+                        return Ok(V::Math);
+                    }
                     return Err("global access");
                 }
                 self.get(&ov, &kv)?
@@ -1073,7 +1239,7 @@ fn strict_eq(l: &V, r: &V) -> bool {
         (V::Num(a), V::Num(b)) => a == b,
         (V::Str(a), V::Str(b)) => a == b,
         (V::Obj(a), V::Obj(b)) => a == b,
-        (V::Global, V::Global) | (V::Dispatch, V::Dispatch) | (V::Code, V::Code) | (V::Frame, V::Frame) => true,
+        (V::Global, V::Global) | (V::Math, V::Math) | (V::Dispatch, V::Dispatch) | (V::Code, V::Code) | (V::Frame, V::Frame) => true,
         (V::Native(a), V::Native(b)) => a == b,
         (V::Handler(a), V::Handler(b)) => a == b,
         (V::Name(a), V::Name(b)) => a == b,
